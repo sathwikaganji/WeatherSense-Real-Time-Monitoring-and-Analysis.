@@ -1,0 +1,189 @@
+import requests
+import schedule
+import time
+import sqlite3
+from datetime import datetime
+from collections import defaultdict
+import matplotlib.pyplot as plt
+
+# OpenWeatherMap API and city configuration
+API_KEY = 'your_openweathermap_api_key'  # Replace with your OpenWeatherMap API key
+CITIES = ['Delhi', 'Mumbai', 'Chennai', 'Bangalore', 'Kolkata', 'Hyderabad']
+BASE_URL = 'http://api.openweathermap.org/data/2.5/weather?q={city}&appid={api_key}'
+DB_NAME = 'weather_data.db'
+
+# Initialize the database to store weather data and daily summaries
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS weather (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            city TEXT,
+            main_condition TEXT,
+            temp REAL,
+            feels_like REAL,
+            timestamp INTEGER,
+            date TEXT
+        )
+    ''')
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS daily_summary (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            city TEXT,
+            avg_temp REAL,
+            max_temp REAL,
+            min_temp REAL,
+            dominant_condition TEXT,
+            date TEXT
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
+
+# Convert temperature from Kelvin to Celsius
+def kelvin_to_celsius(kelvin_temp):
+    return kelvin_temp - 273.15
+
+# Fetch weather data from OpenWeatherMap API for a given city
+def fetch_weather(city):
+    try:
+        url = BASE_URL.format(city=city, api_key=API_KEY)
+        response = requests.get(url)
+        data = response.json()
+
+        if response.status_code == 200:
+            temp = kelvin_to_celsius(data['main']['temp'])
+            feels_like = kelvin_to_celsius(data['main']['feels_like'])
+            main_condition = data['weather'][0]['main']
+            timestamp = data['dt']
+            
+            return {
+                'city': city,
+                'main_condition': main_condition,
+                'temp': temp,
+                'feels_like': feels_like,
+                'timestamp': timestamp
+            }
+        else:
+            print(f"Error fetching data for {city}: {data['message']}")
+            return None
+    except Exception as e:
+        print(f"Exception while fetching weather data: {str(e)}")
+        return None
+
+# Store the weather data in the SQLite database
+def store_weather_data(city, main_condition, temp, feels_like, timestamp):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    date_str = datetime.utcfromtimestamp(timestamp).strftime('%Y-%m-%d')
+    cursor.execute('''
+        INSERT INTO weather (city, main_condition, temp, feels_like, timestamp, date)
+        VALUES (?, ?, ?, ?, ?, ?)
+    ''', (city, main_condition, temp, feels_like, timestamp, date_str))
+    
+    conn.commit()
+    conn.close()
+
+# Generate daily weather summaries with average, max, min temp, and dominant condition
+def daily_summary():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+
+    for city in CITIES:
+        cursor.execute('''
+            SELECT temp, main_condition FROM weather WHERE city = ? AND date = ?
+        ''', (city, datetime.utcnow().strftime('%Y-%m-%d')))
+        
+        rows = cursor.fetchall()
+        if rows:
+            temperatures = [row[0] for row in rows]
+            conditions = [row[1] for row in rows]
+
+            avg_temp = sum(temperatures) / len(temperatures)
+            max_temp = max(temperatures)
+            min_temp = min(temperatures)
+            dominant_condition = max(set(conditions), key=conditions.count)
+
+            cursor.execute('''
+                INSERT INTO daily_summary (city, avg_temp, max_temp, min_temp, dominant_condition, date)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (city, avg_temp, max_temp, min_temp, dominant_condition, datetime.utcnow().strftime('%Y-%m-%d')))
+            conn.commit()
+
+    conn.close()
+
+# Check if the temperature exceeds a user-defined threshold and trigger alerts
+def check_alerts(threshold_temp):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+
+    cursor.execute('''
+        SELECT city, temp FROM weather WHERE date = ? ORDER BY timestamp DESC LIMIT 1
+    ''', (datetime.utcnow().strftime('%Y-%m-%d'),))
+    
+    rows = cursor.fetchall()
+    for row in rows:
+        city, temp = row
+        if temp > threshold_temp:
+            print(f"ALERT: {city} temperature exceeded {threshold_temp}°C, current temp: {temp:.2f}°C")
+    
+    conn.close()
+
+# Fetch weather data for all cities and store in the database
+def fetch_data_for_all_cities():
+    for city in CITIES:
+        weather_data = fetch_weather(city)
+        if weather_data:
+            store_weather_data(
+                weather_data['city'], 
+                weather_data['main_condition'], 
+                weather_data['temp'], 
+                weather_data['feels_like'], 
+                weather_data['timestamp']
+            )
+
+# Display weather trends using matplotlib
+def display_trends():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+
+    for city in CITIES:
+        cursor.execute('''
+            SELECT date, avg_temp FROM daily_summary WHERE city = ?
+        ''', (city,))
+        
+        rows = cursor.fetchall()
+        dates = [row[0] for row in rows]
+        avg_temps = [row[1] for row in rows]
+
+        plt.plot(dates, avg_temps, label=city)
+
+    plt.xlabel('Date')
+    plt.ylabel('Average Temperature (°C)')
+    plt.title('Weather Trends')
+    plt.legend()
+    plt.show()
+
+    conn.close()
+
+# Set up the schedule for periodic tasks (fetching weather data and generating daily summaries)
+def start_scheduler():
+    # Fetch weather data every 5 minutes
+    schedule.every(5).minutes.do(fetch_data_for_all_cities)
+    # Generate daily summaries at midnight UTC
+    schedule.every().day.at("00:00").do(daily_summary)
+    # Check for alerts every 5 minutes with a threshold of 35°C
+    schedule.every(5).minutes.do(lambda: check_alerts(35))
+    
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
+
+# Initialize the database and start the scheduler
+if _name_ == "_main_":
+    init_db()
+    start_scheduler()
